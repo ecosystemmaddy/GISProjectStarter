@@ -1,7 +1,7 @@
 # main.py
 # GIS Project Starter - Boundary by State / City / County FIPS
 # Downloads TIGER 2020 data, builds a boundary from user input,
-# and clips roads + counties to that boundary.
+# and clips counties + state-level primary/secondary roads to that boundary.
 
 import os
 import zipfile
@@ -19,8 +19,7 @@ BASE_URL = "https://www2.census.gov/geo/tiger/TIGER2020"
 LAYER_URLS = {
     "states":   f"{BASE_URL}/STATE/tl_2020_us_state.zip",
     "counties": f"{BASE_URL}/COUNTY/tl_2020_us_county.zip",
-    "roads":    f"{BASE_URL}/PRIMARYROADS/tl_2020_us_primaryroads.zip",
-    # places is handled separately because it's per-state using STATEFP
+    # PRISECROADS handled per-state using STATEFP (01, 02, ..., 72)
 }
 
 PROJECT_FOLDER = "GIS_Project_Starter"
@@ -36,10 +35,7 @@ os.makedirs(CLIPPED_FOLDER, exist_ok=True)
 # ---------------------------------
 
 def download_zip(name: str, url: str) -> str:
-    """
-    Download a ZIP file to downloads/<name>.zip, unless it already exists.
-    Returns the local ZIP path.
-    """
+    """Download a ZIP file to downloads/<name>.zip, unless it already exists."""
     local_path = os.path.join(DOWNLOAD_FOLDER, f"{name}.zip")
     if os.path.exists(local_path):
         print(f"{name}: ZIP already exists, skipping download.")
@@ -47,10 +43,7 @@ def download_zip(name: str, url: str) -> str:
 
     print(f"Downloading {name} from {url} ...")
     resp = requests.get(url, stream=True)
-    try:
-        resp.raise_for_status()
-    except requests.HTTPError as e:
-        raise RuntimeError(f"Failed to download {name} ({url}): {e}")
+    resp.raise_for_status()
 
     with open(local_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
@@ -62,10 +55,7 @@ def download_zip(name: str, url: str) -> str:
 
 
 def unzip_zip(name: str, zip_path: str) -> str:
-    """
-    Unzip ZIP into downloads/<name>/ and return the path
-    to the first .shp found (recursively).
-    """
+    """Unzip ZIP into downloads/<name>/ and return the first .shp path."""
     extract_folder = os.path.join(DOWNLOAD_FOLDER, name)
     os.makedirs(extract_folder, exist_ok=True)
 
@@ -97,23 +87,22 @@ def resolve_state_fips(states_gdf: gpd.GeoDataFrame, user_input: str) -> str:
     return the STATEFP code as a zero-padded string (e.g., '48').
     """
     text = user_input.strip()
-    # Try match by NAME (full name)
+
+    # Try full name
     mask_name = states_gdf["NAME"].str.lower() == text.lower()
     subset = states_gdf[mask_name]
     if not subset.empty:
-        fips = subset.iloc[0]["STATEFP"]
-        return str(fips).zfill(2)
+        return str(subset.iloc[0]["STATEFP"]).zfill(2)
 
-    # Try match by STUSPS (postal, e.g., 'TX')
+    # Try postal code
     mask_code = states_gdf["STUSPS"].str.upper() == text.upper()
     subset = states_gdf[mask_code]
     if not subset.empty:
-        fips = subset.iloc[0]["STATEFP"]
-        return str(fips).zfill(2)
+        return str(subset.iloc[0]["STATEFP"]).zfill(2)
 
     raise ValueError(
         f"Could not resolve state '{user_input}'. "
-        f"Use full name (e.g., Texas) or 2-letter code (e.g., TX)."
+        "Use full name (e.g., Texas) or 2-letter code (e.g., TX)."
     )
 
 
@@ -173,7 +162,6 @@ def build_city_boundary(
     Build a city/place boundary:
       - city_name: e.g., 'Dallas'
       - state_input: state name or code, e.g., 'Texas' or 'TX'
-    Uses state file to get STATEFP, then downloads the correct PLACE ZIP.
     """
     states = gpd.read_file(states_shp)
     state_fips = resolve_state_fips(states, state_input)
@@ -188,7 +176,6 @@ def build_city_boundary(
 
     places = gpd.read_file(place_shp)
 
-    # Filter by city NAME and matching STATEFP
     mask_name = places["NAME"].str.lower() == city_name.strip().lower()
     mask_state = places["STATEFP"] == state_fips
     subset = places[mask_name & mask_state]
@@ -196,7 +183,7 @@ def build_city_boundary(
     if subset.empty:
         raise ValueError(
             f"No place named '{city_name}' found in state '{state_input}' "
-            f"(STATEFP={state_fips}). Remember this uses Census 'place' names."
+            f"(STATEFP={state_fips})."
         )
 
     boundary = subset.dissolve().reset_index(drop=True)
@@ -211,10 +198,14 @@ def clip_layer_to_boundary(
     layer_shp: str,
     boundary_gdf: gpd.GeoDataFrame,
     output_path: str,
-):
-    """Clip any TIGER layer to a polygon boundary using geopandas.clip."""
+) -> None:
+    """Clip a TIGER layer to a polygon boundary, then enforce single geometry type."""
     print(f"Clipping {layer_shp} ...")
     base = gpd.read_file(layer_shp)
+    print(f"  {layer_shp}: {len(base)} features before clip")
+
+    if base.crs is None or boundary_gdf.crs is None:
+        raise ValueError("CRS missing on base or boundary")
 
     # Align CRS
     if base.crs != boundary_gdf.crs:
@@ -223,17 +214,36 @@ def clip_layer_to_boundary(
         boundary = boundary_gdf
 
     clipped = gpd.clip(base, boundary)
+    print(f"  {output_path}: {len(clipped)} features after clip (before geometry filter)")
+
+    # Decide what geometry family to keep based on base layer
+    geom_types = set(base.geom_type.unique())
+    polygonish = {"Polygon", "MultiPolygon"}
+    lineish = {"LineString", "MultiLineString"}
+    pointish = {"Point", "MultiPoint"}
+
+    if geom_types <= polygonish:
+        allowed = polygonish
+    elif geom_types <= lineish:
+        allowed = lineish
+    elif geom_types <= pointish:
+        allowed = pointish
+    else:
+        allowed = geom_types  # fallback
+
+    clipped = clipped[clipped.geometry.type.isin(allowed)].copy()
+    print(f"  {output_path}: {len(clipped)} features after filtering to {allowed}")
 
     Path(os.path.dirname(output_path)).mkdir(parents=True, exist_ok=True)
     clipped.to_file(output_path)
-    print(f"Saved clipped file: {output_path} (features: {len(clipped)})")
+    print(f"Saved clipped file: {output_path}")
 
 
 # ---------------------------------
 # MAIN
 # ---------------------------------
 
-def main():
+def main() -> None:
     print("=== GIS Project Starter (TIGER 2020, State / City / County FIPS) ===\n")
 
     print("Choose boundary type:")
@@ -243,48 +253,66 @@ def main():
     choice = input("Enter 'state', 'city', or 'fips' (or 1/2/3): ").strip().lower()
 
     if choice in ("1", "state"):
-        boundary_type = "state"
+        mode = "state"
         state_input = input("Enter state name or 2-letter code (e.g., Texas or TX): ").strip()
-        city_mode = False
-        fips_value = None
-        city_name = None
-        city_state = None
     elif choice in ("2", "city"):
-        boundary_type = "city"
+        mode = "city"
         city_name = input("Enter city/place name (e.g., Dallas): ").strip()
         city_state = input("Enter state name or code for that city (e.g., Texas or TX): ").strip()
-        city_mode = True
-        fips_value = None
-        state_input = None
     elif choice in ("3", "fips"):
-        boundary_type = "fips"
+        mode = "fips"
         fips_value = input("Enter 5-digit county FIPS code (e.g., 48113): ").strip()
-        city_mode = False
-        state_input = None
-        city_name = None
-        city_state = None
     else:
         raise ValueError("Invalid choice. Use 'state', 'city', or 'fips' (or 1/2/3).")
 
-    # Step 1: Download + unzip the national layers we always need
-    # States, counties, roads
+    # Step 1: Download + unzip national states, counties
     states_zip = download_zip("states", LAYER_URLS["states"])
     states_shp = unzip_zip("states", states_zip)
 
     counties_zip = download_zip("counties", LAYER_URLS["counties"])
     counties_shp = unzip_zip("counties", counties_zip)
 
-    roads_zip = download_zip("roads", LAYER_URLS["roads"])
-    roads_shp = unzip_zip("roads", roads_zip)
+    # Step 2: determine STATEFP for roads (PRISECROADS)
+    states_gdf = gpd.read_file(states_shp)
 
-    # Step 2: Build boundary
-    if city_mode:
+    if mode == "state":
+        state_fips = resolve_state_fips(states_gdf, state_input)
+    elif mode == "city":
+        state_fips = resolve_state_fips(states_gdf, city_state)
+    else:  # mode == "fips"
+        # First 2 digits of county GEOID = state FIPS
+        state_fips = fips_value[:2]
+
+    prisec_name = f"prisecroads_{state_fips}"
+    prisec_url = f"{BASE_URL}/PRISECROADS/tl_2020_{state_fips}_prisecroads.zip"
+    roads_zip = download_zip(prisec_name, prisec_url)
+    roads_shp = unzip_zip(prisec_name, roads_zip)
+
+    # Step 3: Build boundary
+    if mode == "city":
         boundary = build_city_boundary(city_name, city_state, states_shp)
-    else:
-        boundary = build_boundary(boundary_type, state_input or fips_value, states_shp, counties_shp)
+        boundary_type = "city"
+        boundary_value = city_name
+        boundary.to_file(os.path.join(CLIPPED_FOLDER, "city_boundary.shp"))
 
-    # Step 3: Clip roads and counties to boundary
-    print("\nClipping layers to boundary...\n")
+    elif mode == "state":
+        boundary = build_boundary("state", state_input, states_shp, counties_shp)
+        boundary_type = "state"
+        boundary_value = state_input
+    else:  # mode == "fips"
+        boundary = build_boundary("fips", fips_value, states_shp, counties_shp)
+        boundary_type = "fips"
+        boundary_value = fips_value
+
+    # Optional: debug boundary
+    # boundary.to_file(os.path.join(CLIPPED_FOLDER, "boundary_debug.shp"))
+
+    print(f"\nUsing boundary type: {boundary_type}, value: {boundary_value}")
+    print(f"Using state FIPS {state_fips} for PRISECROADS\n")
+
+    # Step 4: Clip roads + counties
+    print("Clipping layers to boundary...\n")
+
     try:
         clip_layer_to_boundary(roads_shp, boundary, os.path.join(CLIPPED_FOLDER, "roads_clipped.shp"))
     except Exception as e:
