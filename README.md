@@ -88,7 +88,7 @@ All results are written to:
 GIS_Project_Starter/clipped/
 
 
-## Executing program
+## Executing Program
 From the project directory, run: 
 
 python main.py
@@ -100,17 +100,17 @@ The script will then prompt for a boundary selection:
 
 ## Example Usage
 1. **State Mode**
-Enter 'state', 'city', or 'fips': state
-Enter state name or 2-letter code: Texas
+Enter 'state', 'city', or 'fips': state  
+Enter state name or 2-letter code: Texas  
 
 2. **City Mode**
-Enter 'state', 'city', or 'fips': city
-Enter city/place name: Dallas
-Enter state name or code: Texas
+Enter 'state', 'city', or 'fips': city  
+Enter city/place name: Dallas  
+Enter state name or code: Texas  
 
 3. **County FIPS Mode**
-Enter 'state', 'city', or 'fips': fips
-Enter 5-digit county FIPS code: 48113
+Enter 'state', 'city', or 'fips': fips  
+Enter 5-digit county FIPS code: 48113  
 
 
 ## Help
